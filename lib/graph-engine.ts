@@ -132,8 +132,17 @@ function computeAccountStats(transactions: Transaction[]) {
 }
 
 // =====================================================
+// Normalize a set of members + pattern into a dedup key
+// Sort member accounts alphabetically and combine with pattern type
+// =====================================================
+function makeRingDeduplicationKey(members: string[], patternType: string): string {
+  const sorted = [...members].sort();
+  return `${patternType}::${sorted.join(",")}`;
+}
+
+// =====================================================
 // Pattern 1: Circular Fund Routing (Cycles of length 3-5)
-// Uses DFS-based cycle detection with Johnson's-style approach
+// Uses DFS-based cycle detection
 // =====================================================
 function detectCycles(
   adj: Map<string, Map<string, Transaction[]>>,
@@ -142,7 +151,6 @@ function detectCycles(
   const cycles: string[][] = [];
   const allNodes = Array.from(allAccounts);
 
-  // DFS-based cycle detection for cycles of length 3-5
   for (const startNode of allNodes) {
     const visited = new Set<string>();
     const path: string[] = [];
@@ -156,7 +164,6 @@ function detectCycles(
       if (neighbors) {
         for (const [neighbor] of neighbors) {
           if (neighbor === startNode && depth >= 3) {
-            // Found a cycle back to start
             cycles.push([...path]);
           } else if (!visited.has(neighbor) && depth < 5) {
             dfs(neighbor, depth + 1);
@@ -171,7 +178,7 @@ function detectCycles(
     dfs(startNode, 1);
   }
 
-  // Deduplicate cycles (same cycle can be found starting from different nodes)
+  // Deduplicate cycles (same cycle found starting from different nodes)
   const uniqueCycles: string[][] = [];
   const seen = new Set<string>();
 
@@ -196,14 +203,13 @@ function detectCycles(
 // Fan-in: 10+ senders -> 1 receiver within 72h window
 // Fan-out: 1 sender -> 10+ receivers within 72h window
 // =====================================================
-function detectSmurfing(transactions: Transaction[], accountStats: ReturnType<typeof computeAccountStats>) {
+function detectSmurfing(transactions: Transaction[]) {
   const WINDOW_MS = 72 * 60 * 60 * 1000; // 72 hours
   const MIN_CONNECTIONS = 10;
 
   const fanInAccounts: Map<string, { senders: string[]; temporal: boolean }> = new Map();
   const fanOutAccounts: Map<string, { receivers: string[]; temporal: boolean }> = new Map();
 
-  // Group transactions by receiver for fan-in analysis
   const byReceiver = new Map<string, Transaction[]>();
   const bySender = new Map<string, Transaction[]>();
 
@@ -218,12 +224,10 @@ function detectSmurfing(transactions: Transaction[], accountStats: ReturnType<ty
   for (const [receiverId, txs] of byReceiver) {
     const uniqueSenders = new Set(txs.map(t => t.sender_id));
     if (uniqueSenders.size >= MIN_CONNECTIONS) {
-      // Check temporal clustering
       const timestamps = txs.map(t => new Date(t.timestamp).getTime()).sort((a, b) => a - b);
       let temporalCluster = false;
       for (let i = 0; i < timestamps.length; i++) {
         const windowEnd = timestamps[i] + WINDOW_MS;
-        const inWindow = timestamps.filter(t => t >= timestamps[i] && t <= windowEnd);
         const sendersInWindow = new Set(
           txs
             .filter(t => {
@@ -277,26 +281,34 @@ function detectSmurfing(transactions: Transaction[], accountStats: ReturnType<ty
 
 // =====================================================
 // Pattern 3: Layered Shell Networks
-// Chains of 3+ hops where intermediate nodes have 2-3 total transactions
+// Chains of 3+ hops where intermediate nodes have low tx degree (2-3)
+// Final destination is always included even if not suspicious
+// Cycle nodes are excluded from shell classification
 // =====================================================
 function detectShellNetworks(
   adj: Map<string, Map<string, Transaction[]>>,
-  accountStats: ReturnType<typeof computeAccountStats>
+  accountStats: ReturnType<typeof computeAccountStats>,
+  cycleNodes: Set<string>
 ): string[][] {
   const chains: string[][] = [];
   const allNodes = Array.from(adj.keys());
 
   for (const startNode of allNodes) {
+    // Skip if start node is part of a cycle
+    if (cycleNodes.has(startNode)) continue;
+
     const visited = new Set<string>();
     const path: string[] = [startNode];
     visited.add(startNode);
 
-    function dfs(current: string, depth: number) {
+    function dfs(current: string) {
       const neighbors = adj.get(current);
       if (!neighbors) return;
 
       for (const [neighbor] of neighbors) {
         if (visited.has(neighbor)) continue;
+        // Skip cycle nodes to avoid misclassification
+        if (cycleNodes.has(neighbor)) continue;
 
         const stats = accountStats.get(neighbor);
         const totalTx = stats ? stats.totalTransactions : 0;
@@ -306,35 +318,35 @@ function detectShellNetworks(
           path.push(neighbor);
           visited.add(neighbor);
 
-          if (path.length >= 3) {
-            // Check if the chain continues or ends
-            const nextNeighbors = adj.get(neighbor);
-            let hasShellContinuation = false;
-            if (nextNeighbors) {
-              for (const [nn] of nextNeighbors) {
-                if (!visited.has(nn)) {
-                  const nnStats = accountStats.get(nn);
-                  const nnTx = nnStats ? nnStats.totalTransactions : 0;
-                  if (nnTx >= 2 && nnTx <= 3) {
-                    hasShellContinuation = true;
+          // Check if there is a next hop (the final destination)
+          const nextNeighbors = adj.get(neighbor);
+          if (nextNeighbors) {
+            for (const [nn] of nextNeighbors) {
+              if (!visited.has(nn) && !cycleNodes.has(nn)) {
+                const nnStats = accountStats.get(nn);
+                const nnTx = nnStats ? nnStats.totalTransactions : 0;
+
+                if (nnTx >= 2 && nnTx <= 3) {
+                  // Continue the chain through another shell node
+                  // Will be explored on next dfs call
+                } else {
+                  // This is the final destination - include it in the chain
+                  // even if it doesn't have low tx count
+                  if (path.length >= 2) {
+                    // path has start + intermediaries, add final dest
+                    chains.push([...path, nn]);
                   }
                 }
               }
             }
-
-            // Record chains of 3+ nodes
-            if (path.length >= 3) {
-              chains.push([...path]);
-            }
-
-            if (depth < 6) {
-              dfs(neighbor, depth + 1);
-            }
-          } else {
-            if (depth < 6) {
-              dfs(neighbor, depth + 1);
-            }
           }
+
+          // Record current chain if it's 3+ hops (path already has 3+ nodes)
+          if (path.length >= 3) {
+            chains.push([...path]);
+          }
+
+          dfs(neighbor);
 
           path.pop();
           visited.delete(neighbor);
@@ -342,30 +354,25 @@ function detectShellNetworks(
       }
     }
 
-    dfs(startNode, 1);
+    dfs(startNode);
   }
 
-  // Deduplicate: keep longest chains that aren't subsets
+  // Deduplicate: keep longest chains, remove subsets
   const sortedChains = chains.sort((a, b) => b.length - a.length);
   const uniqueChains: string[][] = [];
-  const usedKeys = new Set<string>();
 
   for (const chain of sortedChains) {
-    const key = chain.join("|");
-    if (!usedKeys.has(key)) {
-      // Check if this chain is a subset of an existing one
-      let isSubset = false;
-      for (const existing of uniqueChains) {
-        const existingStr = existing.join("|");
-        if (existingStr.includes(key)) {
-          isSubset = true;
-          break;
-        }
+    const chainSet = new Set(chain);
+    let isSubset = false;
+    for (const existing of uniqueChains) {
+      const existingSet = new Set(existing);
+      if (chain.every(node => existingSet.has(node))) {
+        isSubset = true;
+        break;
       }
-      if (!isSubset) {
-        usedKeys.add(key);
-        uniqueChains.push(chain);
-      }
+    }
+    if (!isSubset) {
+      uniqueChains.push(chain);
     }
   }
 
@@ -374,7 +381,7 @@ function detectShellNetworks(
 
 // =====================================================
 // Suspicion Score Calculation
-// Weighted composite score based on multiple factors
+// Returns a float between 0.0 and 100.0
 // =====================================================
 function calculateSuspicionScore(
   accountId: string,
@@ -385,36 +392,40 @@ function calculateSuspicionScore(
   isShellNode: boolean,
   temporalFlag: boolean
 ): number {
-  let score = 0;
+  let score = 0.0;
 
   // Base pattern scores
   if (patterns.some(p => p.startsWith("cycle_length_"))) {
-    score += 35; // Cycles are strong indicators
-    score += Math.min(cycleCount - 1, 3) * 10; // Additional cycles increase score
+    score += 35.0;
+    score += Math.min(cycleCount - 1, 3) * 10.0;
   }
 
-  if (patterns.includes("fan_in")) score += 25;
-  if (patterns.includes("fan_out")) score += 25;
-  if (patterns.includes("shell_network")) score += 20;
+  if (patterns.includes("fan_in")) score += 25.0;
+  if (patterns.includes("fan_out")) score += 25.0;
+  if (patterns.includes("shell_network")) score += 20.0;
 
   // Temporal analysis bonus
-  if (temporalFlag) score += 15;
+  if (temporalFlag) score += 15.0;
 
   // Transaction pattern analysis
   const stats = accountStats.get(accountId);
   if (stats) {
-    // Accounts that send and receive similar amounts (pass-through)
     const totalFlow = stats.totalSent + stats.totalReceived;
     if (totalFlow > 0) {
-      const flowRatio = Math.min(stats.totalSent, stats.totalReceived) / Math.max(stats.totalSent, stats.totalReceived);
-      if (flowRatio > 0.7 && flowRatio < 1.0) {
-        score += 10; // Near-equal in/out suggests pass-through
+      const maxFlow = Math.max(stats.totalSent, stats.totalReceived);
+      if (maxFlow > 0) {
+        const flowRatio = Math.min(stats.totalSent, stats.totalReceived) / maxFlow;
+        if (flowRatio > 0.7 && flowRatio < 1.0) {
+          score += 10.0; // Near-equal in/out suggests pass-through
+        }
       }
     }
   }
 
-  // Cap at 100
-  return Math.min(Math.round(score * 10) / 10, 100);
+  // Ensure float and cap at 100.0
+  const capped = Math.min(score, 100.0);
+  // Round to 1 decimal place, ensure float format
+  return Math.round(capped * 10) / 10;
 }
 
 // =====================================================
@@ -432,6 +443,9 @@ export function analyzeTransactions(transactions: Transaction[]): AnalysisResult
   const accountRings = new Map<string, Set<string>>();
   const fraudRings: FraudRing[] = [];
 
+  // Ring deduplication set: normalized key -> true
+  const ringDeduplicationSet = new Set<string>();
+
   function addPattern(accountId: string, pattern: string) {
     if (!accountPatterns.has(accountId)) accountPatterns.set(accountId, new Set());
     accountPatterns.get(accountId)!.add(pattern);
@@ -444,90 +458,124 @@ export function analyzeTransactions(transactions: Transaction[]): AnalysisResult
 
   let ringCounter = 1;
 
+  // Helper to generate sequential ring IDs
+  function nextRingId(): string {
+    const id = `RING_${String(ringCounter).padStart(3, "0")}`;
+    ringCounter++;
+    return id;
+  }
+
   // ---- Detect Cycles ----
   const cycles = detectCycles(adj, allAccounts);
   const accountCycleCounts = new Map<string, number>();
 
+  // Collect all nodes in cycles for shell network exclusion
+  const cycleNodes = new Set<string>();
+
   for (const cycle of cycles) {
-    const ringId = `RING_${String(ringCounter).padStart(3, "0")}`;
-    ringCounter++;
+    // Deduplication: check if this set of members + pattern already exists
+    const dedupKey = makeRingDeduplicationKey(cycle, "cycle");
+    if (ringDeduplicationSet.has(dedupKey)) continue;
+    ringDeduplicationSet.add(dedupKey);
+
+    const ringId = nextRingId();
 
     for (const account of cycle) {
       addPattern(account, `cycle_length_${cycle.length}`);
       addRing(account, ringId);
       accountCycleCounts.set(account, (accountCycleCounts.get(account) || 0) + 1);
+      cycleNodes.add(account);
     }
 
+    const riskScore = Math.min(70.0 + cycle.length * 5.0, 100.0);
     fraudRings.push({
       ring_id: ringId,
       member_accounts: [...cycle],
       pattern_type: "cycle",
-      risk_score: Math.min(70 + cycle.length * 5 + Math.random() * 10, 100),
+      risk_score: Math.round(riskScore * 10) / 10,
     });
   }
 
   // ---- Detect Smurfing ----
-  const { fanInAccounts, fanOutAccounts } = detectSmurfing(transactions, accountStats);
+  const { fanInAccounts, fanOutAccounts } = detectSmurfing(transactions);
 
   for (const [accountId, data] of fanInAccounts) {
-    const ringId = `RING_${String(ringCounter).padStart(3, "0")}`;
-    ringCounter++;
+    const members = [accountId, ...data.senders];
+
+    // Deduplication check
+    const dedupKey = makeRingDeduplicationKey(members, "fan_in");
+    if (ringDeduplicationSet.has(dedupKey)) continue;
+    ringDeduplicationSet.add(dedupKey);
+
+    const ringId = nextRingId();
 
     addPattern(accountId, "fan_in");
     addRing(accountId, ringId);
 
-    const members = [accountId, ...data.senders];
     for (const sender of data.senders) {
       addPattern(sender, "fan_in");
       addRing(sender, ringId);
     }
 
+    const riskScore = Math.min(60.0 + (data.temporal ? 25.0 : 10.0) + data.senders.length * 0.5, 100.0);
     fraudRings.push({
       ring_id: ringId,
       member_accounts: members,
       pattern_type: "fan_in",
-      risk_score: Math.min(60 + (data.temporal ? 25 : 10) + data.senders.length * 0.5, 100),
+      risk_score: Math.round(riskScore * 10) / 10,
     });
   }
 
   for (const [accountId, data] of fanOutAccounts) {
-    const ringId = `RING_${String(ringCounter).padStart(3, "0")}`;
-    ringCounter++;
+    const members = [accountId, ...data.receivers];
+
+    // Deduplication check
+    const dedupKey = makeRingDeduplicationKey(members, "fan_out");
+    if (ringDeduplicationSet.has(dedupKey)) continue;
+    ringDeduplicationSet.add(dedupKey);
+
+    const ringId = nextRingId();
 
     addPattern(accountId, "fan_out");
     addRing(accountId, ringId);
 
-    const members = [accountId, ...data.receivers];
     for (const receiver of data.receivers) {
       addPattern(receiver, "fan_out");
       addRing(receiver, ringId);
     }
 
+    const riskScore = Math.min(60.0 + (data.temporal ? 25.0 : 10.0) + data.receivers.length * 0.5, 100.0);
     fraudRings.push({
       ring_id: ringId,
       member_accounts: members,
       pattern_type: "fan_out",
-      risk_score: Math.min(60 + (data.temporal ? 25 : 10) + data.receivers.length * 0.5, 100),
+      risk_score: Math.round(riskScore * 10) / 10,
     });
   }
 
   // ---- Detect Shell Networks ----
-  const shellChains = detectShellNetworks(adj, accountStats);
+  // Pass cycleNodes so shell detection excludes cycle-classified nodes
+  const shellChains = detectShellNetworks(adj, accountStats, cycleNodes);
 
   for (const chain of shellChains) {
-    const ringId = `RING_${String(ringCounter).padStart(3, "0")}`;
-    ringCounter++;
+    // Deduplication check
+    const dedupKey = makeRingDeduplicationKey(chain, "shell_network");
+    if (ringDeduplicationSet.has(dedupKey)) continue;
+    ringDeduplicationSet.add(dedupKey);
+
+    const ringId = nextRingId();
 
     for (const account of chain) {
       addPattern(account, "shell_network");
       addRing(account, ringId);
     }
 
+    const riskScore = Math.min(50.0 + chain.length * 8.0, 100.0);
     fraudRings.push({
       ring_id: ringId,
       member_accounts: [...chain],
       pattern_type: "shell_network",
-      risk_score: Math.min(50 + chain.length * 8, 100),
+      risk_score: Math.round(riskScore * 10) / 10,
     });
   }
 
@@ -540,7 +588,7 @@ export function analyzeTransactions(transactions: Transaction[]): AnalysisResult
 
     const isFanIn = fanInAccounts.has(accountId);
     const isFanOut = fanOutAccounts.has(accountId);
-    const temporalFlag = 
+    const temporalFlag =
       (isFanIn && fanInAccounts.get(accountId)!.temporal) ||
       (isFanOut && fanOutAccounts.get(accountId)!.temporal);
 
@@ -565,13 +613,8 @@ export function analyzeTransactions(transactions: Transaction[]): AnalysisResult
     });
   }
 
-  // Sort by suspicion score descending
+  // Sort suspicious accounts by suspicion_score descending
   suspiciousAccounts.sort((a, b) => b.suspicion_score - a.suspicion_score);
-
-  // Round ring risk scores
-  for (const ring of fraudRings) {
-    ring.risk_score = Math.round(ring.risk_score * 10) / 10;
-  }
 
   // ---- Build Graph Nodes ----
   const suspiciousSet = new Set(suspiciousAccounts.map(a => a.account_id));
@@ -591,7 +634,7 @@ export function analyzeTransactions(transactions: Transaction[]): AnalysisResult
       total_sent: stats?.totalSent || 0,
       total_received: stats?.totalReceived || 0,
       transaction_count: stats?.totalTransactions || 0,
-      suspicion_score: sa?.suspicion_score || 0,
+      suspicion_score: sa?.suspicion_score || 0.0,
     });
   }
 
@@ -604,8 +647,11 @@ export function analyzeTransactions(transactions: Transaction[]): AnalysisResult
     transaction_id: tx.transaction_id,
   }));
 
+  // ---- Compute processing time properly ----
   const endTime = performance.now();
+  const processingTimeSeconds = Math.round(((endTime - startTime) / 1000) * 1000) / 1000;
 
+  // ---- Summary is computed dynamically from actual results ----
   return {
     suspicious_accounts: suspiciousAccounts,
     fraud_rings: fraudRings,
@@ -613,7 +659,7 @@ export function analyzeTransactions(transactions: Transaction[]): AnalysisResult
       total_accounts_analyzed: allAccounts.size,
       suspicious_accounts_flagged: suspiciousAccounts.length,
       fraud_rings_detected: fraudRings.length,
-      processing_time_seconds: Math.round((endTime - startTime) / 100) / 10,
+      processing_time_seconds: processingTimeSeconds,
     },
     nodes,
     edges,
