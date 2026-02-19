@@ -29,6 +29,7 @@ export interface AnalysisSummary {
   total_accounts_analyzed: number;
   suspicious_accounts_flagged: number;
   fraud_rings_detected: number;
+  legitimate_accounts_filtered: number;
   processing_time_seconds: number;
 }
 
@@ -57,6 +58,145 @@ export interface GraphEdge {
   amount: number;
   timestamp: string;
   transaction_id: string;
+}
+
+// =====================================================
+// Legitimate Business Account Detection
+// Identifies payroll, rent, vendor, merchant accounts
+// that should be excluded BEFORE fraud detection runs.
+// This prevents false positives on normal business traffic.
+// =====================================================
+function detectLegitimateAccounts(transactions: Transaction[]): Set<string> {
+  const legit = new Set<string>();
+
+  // Gather per-account stats for classification
+  const accountTxs = new Map<string, {
+    sent: Transaction[];
+    received: Transaction[];
+    uniqueSenders: Set<string>;
+    uniqueReceivers: Set<string>;
+    totalSent: number;
+    totalReceived: number;
+  }>();
+
+  function getOrCreate(id: string) {
+    if (!accountTxs.has(id)) {
+      accountTxs.set(id, {
+        sent: [],
+        received: [],
+        uniqueSenders: new Set(),
+        uniqueReceivers: new Set(),
+        totalSent: 0,
+        totalReceived: 0,
+      });
+    }
+    return accountTxs.get(id)!;
+  }
+
+  for (const tx of transactions) {
+    const s = getOrCreate(tx.sender_id);
+    s.sent.push(tx);
+    s.uniqueReceivers.add(tx.receiver_id);
+    s.totalSent += tx.amount;
+
+    const r = getOrCreate(tx.receiver_id);
+    r.received.push(tx);
+    r.uniqueSenders.add(tx.sender_id);
+    r.totalReceived += tx.amount;
+  }
+
+  for (const [accountId, data] of accountTxs) {
+    const nameUpper = accountId.toUpperCase();
+
+    // --- Heuristic 1: Name-based detection ---
+    // Common legitimate business name patterns
+    const businessKeywords = [
+      "COMPANY", "CORP", "INC", "LLC", "LTD", "ENTERPRISE",
+      "PAYROLL", "SALARY", "WAGE", "HR_", "HUMAN_RESOURCE",
+      "RENT", "LANDLORD", "PROPERTY", "REALTY", "HOUSING",
+      "VENDOR", "SUPPLIER", "SUPPLY", "WHOLESALE",
+      "GROCERY", "STORE", "SHOP", "MARKET", "RETAIL",
+      "UTILITY", "ELECTRIC", "WATER", "GAS_CO", "POWER",
+      "INSURANCE", "INSURE",
+      "BANK", "CREDIT_UNION", "MORTGAGE",
+      "GOVERNMENT", "GOV_", "TAX_", "IRS",
+      "SCHOOL", "UNIVERSITY", "COLLEGE",
+      "HOSPITAL", "CLINIC", "MEDICAL", "HEALTH",
+      "TELECOM", "PHONE", "MOBILE", "INTERNET",
+      "SUBSCRIPTION", "NETFLIX", "SPOTIFY",
+    ];
+    const hasBusinessName = businessKeywords.some(kw => nameUpper.includes(kw));
+
+    // --- Heuristic 2: Payroll pattern ---
+    // One sender paying many unique receivers with similar/regular amounts
+    const isPayrollLike = data.uniqueReceivers.size >= 5 && data.sent.length >= 5 && (() => {
+      const amounts = data.sent.map(t => t.amount);
+      // Check if amounts are relatively consistent (low coefficient of variation)
+      const mean = amounts.reduce((a, b) => a + b, 0) / amounts.length;
+      if (mean === 0) return false;
+      const variance = amounts.reduce((a, b) => a + (b - mean) ** 2, 0) / amounts.length;
+      const cv = Math.sqrt(variance) / mean;
+      return cv < 0.3; // Consistent amounts = likely payroll
+    })();
+
+    // --- Heuristic 3: Rent/subscription collector ---
+    // One receiver collecting from many senders with regular amounts
+    const isRentCollector = data.uniqueSenders.size >= 5 && data.received.length >= 5 && (() => {
+      const amounts = data.received.map(t => t.amount);
+      const mean = amounts.reduce((a, b) => a + b, 0) / amounts.length;
+      if (mean === 0) return false;
+      const variance = amounts.reduce((a, b) => a + (b - mean) ** 2, 0) / amounts.length;
+      const cv = Math.sqrt(variance) / mean;
+      return cv < 0.3; // Consistent amounts = likely rent collection
+    })();
+
+    // --- Heuristic 4: Merchant/vendor pattern ---
+    // Receives from many unique senders (customers) with varying amounts
+    // AND does NOT send to many unique accounts (merchants collect, they don't redistribute)
+    const isMerchant = data.uniqueSenders.size >= 8 &&
+      data.uniqueReceivers.size <= 3 &&
+      data.totalReceived > data.totalSent * 5;
+
+    // --- Heuristic 5: Pure payer (utility, employer) ---
+    // Sends to many, receives from almost none
+    const isPurePayer = data.uniqueReceivers.size >= 5 &&
+      data.uniqueSenders.size <= 1 &&
+      data.totalSent > data.totalReceived * 5;
+
+    // --- Heuristic 6: One-directional flow (no pass-through) ---
+    // Legitimate accounts are NOT pass-through: they either mostly send OR mostly receive
+    const flowRatio = data.totalSent > 0 && data.totalReceived > 0
+      ? Math.min(data.totalSent, data.totalReceived) / Math.max(data.totalSent, data.totalReceived)
+      : 0;
+    const isOneDirectional = flowRatio < 0.15; // Very lopsided = legitimate
+
+    // Classify as legitimate if name matches OR behavioral pattern is strong
+    if (hasBusinessName) {
+      legit.add(accountId);
+    } else if (isPayrollLike && isOneDirectional) {
+      legit.add(accountId);
+    } else if (isRentCollector && isOneDirectional) {
+      legit.add(accountId);
+    } else if (isMerchant) {
+      legit.add(accountId);
+    } else if (isPurePayer) {
+      legit.add(accountId);
+    }
+  }
+
+  return legit;
+}
+
+// Remove all transactions involving legitimate accounts
+// This MUST be called BEFORE fraud detection to prevent false positives
+function removeLegitimateTransactions(
+  transactions: Transaction[],
+  legitimateAccounts: Set<string>
+): Transaction[] {
+  if (legitimateAccounts.size === 0) return transactions;
+  return transactions.filter(
+    tx => !legitimateAccounts.has(tx.sender_id) && !legitimateAccounts.has(tx.receiver_id)
+  );
 }
 
 // Build adjacency list from transactions
@@ -434,9 +574,54 @@ function calculateSuspicionScore(
 export function analyzeTransactions(transactions: Transaction[]): AnalysisResult {
   const startTime = performance.now();
 
-  const allAccounts = getAllAccounts(transactions);
-  const adj = buildAdjacencyList(transactions);
-  const accountStats = computeAccountStats(transactions);
+  // Total accounts BEFORE filtering (for summary reporting)
+  const allAccountsBeforeFilter = getAllAccounts(transactions);
+
+  // =====================================================
+  // CRITICAL: Remove legitimate business transactions FIRST
+  // This prevents payroll, rent, vendor, and merchant
+  // accounts from being misclassified as fraud rings.
+  // =====================================================
+  const legitimateAccounts = detectLegitimateAccounts(transactions);
+  const filteredTransactions = removeLegitimateTransactions(transactions, legitimateAccounts);
+
+  // If all transactions were filtered out, return empty results
+  if (filteredTransactions.length === 0) {
+    const endTime = performance.now();
+    return {
+      suspicious_accounts: [],
+      fraud_rings: [],
+      summary: {
+        total_accounts_analyzed: allAccountsBeforeFilter.size,
+        suspicious_accounts_flagged: 0,
+        fraud_rings_detected: 0,
+        legitimate_accounts_filtered: legitimateAccounts.size,
+        processing_time_seconds: Math.round(((endTime - startTime) / 1000) * 1000) / 1000,
+      },
+      nodes: Array.from(allAccountsBeforeFilter).map(id => ({
+        id,
+        suspicious: false,
+        ring_ids: [],
+        patterns: legitimateAccounts.has(id) ? ["legitimate_business"] : [],
+        total_sent: 0,
+        total_received: 0,
+        transaction_count: 0,
+        suspicion_score: 0.0,
+      })),
+      edges: transactions.map(tx => ({
+        source: tx.sender_id,
+        target: tx.receiver_id,
+        amount: tx.amount,
+        timestamp: tx.timestamp,
+        transaction_id: tx.transaction_id,
+      })),
+    };
+  }
+
+  // Run all detection on FILTERED transactions only
+  const allAccounts = getAllAccounts(filteredTransactions);
+  const adj = buildAdjacencyList(filteredTransactions);
+  const accountStats = computeAccountStats(filteredTransactions);
 
   // Track patterns per account
   const accountPatterns = new Map<string, Set<string>>();
@@ -617,20 +802,25 @@ export function analyzeTransactions(transactions: Transaction[]): AnalysisResult
   suspiciousAccounts.sort((a, b) => b.suspicion_score - a.suspicion_score);
 
   // ---- Build Graph Nodes ----
+  // Include ALL accounts (both filtered suspicious AND legitimate) in graph
   const suspiciousSet = new Set(suspiciousAccounts.map(a => a.account_id));
   const nodes: GraphNode[] = [];
+  const allOriginalStats = computeAccountStats(transactions);
 
-  for (const accountId of allAccounts) {
-    const stats = accountStats.get(accountId);
+  for (const accountId of allAccountsBeforeFilter) {
+    const stats = allOriginalStats.get(accountId);
     const rings = accountRings.get(accountId);
     const patterns = accountPatterns.get(accountId);
     const sa = suspiciousAccounts.find(a => a.account_id === accountId);
+    const isLegit = legitimateAccounts.has(accountId);
 
     nodes.push({
       id: accountId,
       suspicious: suspiciousSet.has(accountId),
       ring_ids: rings ? Array.from(rings) : [],
-      patterns: patterns ? Array.from(patterns) : [],
+      patterns: isLegit
+        ? ["legitimate_business"]
+        : patterns ? Array.from(patterns) : [],
       total_sent: stats?.totalSent || 0,
       total_received: stats?.totalReceived || 0,
       transaction_count: stats?.totalTransactions || 0,
@@ -656,9 +846,10 @@ export function analyzeTransactions(transactions: Transaction[]): AnalysisResult
     suspicious_accounts: suspiciousAccounts,
     fraud_rings: fraudRings,
     summary: {
-      total_accounts_analyzed: allAccounts.size,
+      total_accounts_analyzed: allAccountsBeforeFilter.size,
       suspicious_accounts_flagged: suspiciousAccounts.length,
       fraud_rings_detected: fraudRings.length,
+      legitimate_accounts_filtered: legitimateAccounts.size,
       processing_time_seconds: processingTimeSeconds,
     },
     nodes,

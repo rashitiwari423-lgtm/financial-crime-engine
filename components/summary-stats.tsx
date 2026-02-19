@@ -1,6 +1,6 @@
 "use client";
 
-import { Activity, AlertTriangle, Network, Clock } from "lucide-react";
+import { Activity, AlertTriangle, Network, Clock, ShieldCheck } from "lucide-react";
 import type { AnalysisSummary } from "@/lib/graph-engine";
 
 interface SummaryStatsProps {
@@ -15,6 +15,13 @@ export function SummaryStats({ summary }: SummaryStatsProps) {
       icon: Activity,
       color: "text-primary",
       bgColor: "bg-primary/10",
+    },
+    {
+      label: "Legitimate Filtered",
+      value: summary.legitimate_accounts_filtered.toLocaleString(),
+      icon: ShieldCheck,
+      color: "text-success",
+      bgColor: "bg-success/10",
     },
     {
       label: "Suspicious Accounts",
@@ -34,13 +41,13 @@ export function SummaryStats({ summary }: SummaryStatsProps) {
       label: "Processing Time",
       value: `${summary.processing_time_seconds}s`,
       icon: Clock,
-      color: "text-success",
-      bgColor: "bg-success/10",
+      color: "text-muted-foreground",
+      bgColor: "bg-muted",
     },
   ];
 
   return (
-    <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+    <div className="grid grid-cols-2 gap-4 md:grid-cols-3 lg:grid-cols-5">
       {stats.map((stat) => (
         <div
           key={stat.label}

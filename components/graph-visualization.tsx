@@ -226,6 +226,15 @@ export function GraphVisualization({ nodes, edges }: GraphVisualizationProps) {
           ctx.strokeStyle = "#09090b";
           ctx.lineWidth = 1.5;
           ctx.stroke();
+        } else if (node.patterns.includes("legitimate_business")) {
+          // Legitimate business node - green
+          ctx.beginPath();
+          ctx.arc(node.x, node.y, radius + 1, 0, Math.PI * 2);
+          ctx.fillStyle = "#22c55e";
+          ctx.fill();
+          ctx.strokeStyle = "#09090b";
+          ctx.lineWidth = 1;
+          ctx.stroke();
         } else {
           ctx.beginPath();
           ctx.arc(node.x, node.y, radius, 0, Math.PI * 2);
@@ -341,6 +350,10 @@ export function GraphVisualization({ nodes, edges }: GraphVisualizationProps) {
           <span className="text-muted-foreground">Normal account</span>
         </div>
         <div className="flex items-center gap-2">
+          <span className="inline-block h-3 w-3 rounded-full bg-[#22c55e]" />
+          <span className="text-muted-foreground">Legitimate business (filtered)</span>
+        </div>
+        <div className="flex items-center gap-2">
           <span className="inline-block h-3 w-3 rounded-full bg-[#ef4444]" />
           <span className="text-muted-foreground">Suspicious account</span>
         </div>
@@ -375,6 +388,13 @@ export function GraphVisualization({ nodes, edges }: GraphVisualizationProps) {
               <span className="text-muted-foreground">Transactions</span>
               <span className="text-foreground font-mono">{hoveredNode.transaction_count}</span>
             </div>
+            {hoveredNode.patterns.includes("legitimate_business") && (
+              <div className="mt-1 border-t border-border pt-1">
+                <span className="rounded bg-[#22c55e]/15 px-1.5 py-0.5 text-[10px] font-mono text-[#22c55e]">
+                  legitimate_business (filtered)
+                </span>
+              </div>
+            )}
             {hoveredNode.suspicious && (
               <>
                 <div className="mt-1 border-t border-border pt-1">
